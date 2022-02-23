@@ -5,16 +5,18 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use futures::prelude::*;
 use kubert::shutdown;
-use linkerd_policy_controller::admission;
-use linkerd_policy_controller::k8s::DefaultPolicy;
+use linkerd_policy_controller::{admission, api, init, k8s};
 use linkerd_policy_controller_core::IpNet;
-use std::net::SocketAddr;
+use parking_lot::Mutex;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time;
-use tracing::{info, instrument};
+use tracing::{info, info_span, instrument, Instrument};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+const DETECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[clap(name = "policy", about = "A policy resource prototype")]
@@ -59,7 +61,7 @@ struct Args {
     identity_domain: String,
 
     #[clap(long, default_value = "all-unauthenticated")]
-    default_policy: DefaultPolicy,
+    default_policy: k8s::DefaultPolicy,
 
     #[clap(long, default_value = "linkerd")]
     control_plane_namespace: String,
@@ -89,29 +91,72 @@ async fn main() -> Result<()> {
 
     let (shutdown, drain_rx) = shutdown::channel();
 
-    // Load a Kubernetes client from the environment (check for in-cluster configuration first).
+    // Load a Kubernetes client from the environment/CLI, checking for in-cluster configuration
+    // first.
     let client = client
         .try_client()
         .await
         .context("failed to initialize kubernetes client")?;
 
-    // Index cluster resources, returning a handle that supports lookups for the gRPC server.
-    let handle = {
-        const DETECT_TIMEOUT: time::Duration = time::Duration::from_secs(10);
-        let cluster = linkerd_policy_controller::k8s::ClusterInfo {
+    // Build the index data structure, which will be used to process events from all watches
+    // The lookup handle is used by the gRPC server.
+    let (lookup, index) = {
+        let cluster = k8s::ClusterInfo {
             networks: cluster_networks.clone(),
             identity_domain,
             control_plane_ns: control_plane_namespace,
         };
-        let (handle, index) =
-            linkerd_policy_controller::k8s::Index::new(cluster, default_policy, DETECT_TIMEOUT);
-
-        tokio::spawn(index.run(client.clone(), readiness.clone()));
-        handle
+        let (lookup, idx) = k8s::Index::new(cluster, default_policy, DETECT_TIMEOUT);
+        (lookup, Arc::new(Mutex::new(idx)))
     };
 
+    let mut init = init::Initialize::default();
+    let backoff = Duration::from_secs(5);
+
+    // Spawn a Pod index
+    tokio::spawn(
+        api::index(
+            api::watch_all_injected_pods(client.clone()),
+            init.add_handle(),
+            backoff,
+            index.clone(),
+            k8s::handle_pods,
+        )
+        .instrument(info_span!("pods")),
+    );
+
+    // Spawn a server watcher
+    tokio::spawn(
+        api::index(
+            api::watch_all_servers(client.clone()),
+            init.add_handle(),
+            backoff,
+            index.clone(),
+            k8s::handle_servers,
+        )
+        .instrument(info_span!("servers")),
+    );
+
+    // Spawn a server watcher
+    tokio::spawn(
+        api::index(
+            api::watch_all_serverauthorizations(client.clone()),
+            init.add_handle(),
+            backoff,
+            index,
+            k8s::handle_serverauthorizations,
+        )
+        .instrument(info_span!("serverauthorizations")),
+    );
+
+    // Spawn a task that marks the process as "ready" once all watches have been initialized.
+    tokio::spawn({
+        let readiness = readiness.clone();
+        init.initialized().map(move |_| readiness.set(true))
+    });
+
     // Run the gRPC server, serving results by looking up against the index handle.
-    tokio::spawn(grpc(grpc_addr, cluster_networks, handle, drain_rx.clone()));
+    tokio::spawn(grpc(grpc_addr, cluster_networks, lookup, drain_rx.clone()));
 
     if admission_controller_disabled {
         tracing::info!("Admission controller disabled");

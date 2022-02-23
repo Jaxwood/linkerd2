@@ -42,12 +42,9 @@ use self::{
     namespace::{Namespace, NamespaceIndex},
     server::SrvIndex,
 };
-use anyhow::Context;
-use kubert::admin::Readiness;
 use linkerd_policy_controller_core::{InboundServer, IpNet};
-use linkerd_policy_controller_k8s_api::{self as k8s};
+use linkerd_policy_controller_k8s_api as k8s;
 use tokio::{sync::watch, time};
-use tracing::{debug, warn};
 
 /// Watches a server's configuration for server/authorization changes.
 type ServerRx = watch::Receiver<InboundServer>;
@@ -91,10 +88,8 @@ pub struct Index {
 
     /// A handle that supports updates to the lookup index.
     lookups: lookup::Writer,
+    //stores: k8s::Stores,
 }
-
-#[derive(Debug)]
-struct Errors(Vec<anyhow::Error>);
 
 // === impl Index ===
 
@@ -103,6 +98,7 @@ impl Index {
         cluster_info: ClusterInfo,
         default_policy: DefaultPolicy,
         detect_timeout: time::Duration,
+        // stores: k8s::Stores,
     ) -> (lookup::Reader, Self) {
         // Create a common set of receivers for all supported default policies.
         let default_policy_watches =
@@ -118,97 +114,35 @@ impl Index {
             namespaces,
             cluster_info,
             default_policy_watches,
+            // stores,
         };
         (reader, idx)
     }
+}
 
-    /// Drives indexing for all resource types.
-    ///
-    /// This is all driven on a single task, so it's not necessary for any of the indexing logic to
-    /// worry about concurrent access for the internal indexing structures.
-    ///
-    /// All updates are atomically published to the shared `lookups` map after indexing occurs; but
-    /// the indexing task is solely responsible for mutating it.
-    pub async fn run(mut self, resources: impl Into<k8s::ResourceWatches>, ready: Readiness) {
-        let k8s::ResourceWatches {
-            mut pods_rx,
-            mut servers_rx,
-            mut authorizations_rx,
-        } = resources.into();
-
-        let mut initialized = false;
-        loop {
-            let res = tokio::select! {
-                // Track pods against the appropriate server.
-                up = pods_rx.recv() => match up {
-                    k8s::Event::Applied(pod) => self.apply_pod(pod).context("applying a pod"),
-                    k8s::Event::Deleted(pod) => self.delete_pod(pod).context("deleting a pod"),
-                    k8s::Event::Restarted(pods) => self.reset_pods(pods).context("resetting pods"),
-                },
-
-                // Track servers and link them with pods.
-                up = servers_rx.recv() => match up {
-                    k8s::Event::Applied(srv) => {
-                        self.apply_server(srv);
-                        Ok(())
-                    }
-                    k8s::Event::Deleted(srv) => self.delete_server(srv).context("deleting a server"),
-                    k8s::Event::Restarted(srvs) => self.reset_servers(srvs).context("resetting servers"),
-                },
-
-                // Track authorizations and update relevant servers.
-                up = authorizations_rx.recv() => match up {
-                    k8s::Event::Applied(authz) => self.apply_authz(authz).context("applying an authorization"),
-                    k8s::Event::Deleted(authz) => {
-                        self.delete_authz(authz);
-                        Ok(())
-                    }
-                    k8s::Event::Restarted(authzs) => self.reset_authzs(authzs).context("resetting authorizations"),
-                },
-            };
-
-            if let Err(error) = res {
-                warn!(?error);
-            }
-
-            // Notify the readiness watch once all watches have updated.
-            if !initialized
-                && pods_rx.is_initialized()
-                && servers_rx.is_initialized()
-                && authorizations_rx.is_initialized()
-            {
-                let _ = ready.set(true);
-                initialized = true;
-                debug!("Ready");
-            }
-        }
+pub fn handle_pods(idx: &mut Index, ev: k8s::Event<k8s::Pod>) {
+    match ev {
+        k8s::Event::Applied(pod) => idx.apply_pod(pod),
+        k8s::Event::Deleted(pod) => idx.delete_pod(pod),
+        k8s::Event::Restarted(pods) => idx.reset_pods(pods),
     }
 }
 
-// === impl Errors ===
-
-impl std::fmt::Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0[0])?;
-        for e in &self.0[1..] {
-            write!(f, "; and {}", e)?;
-        }
-        Ok(())
+pub fn handle_servers(idx: &mut Index, ev: k8s::Event<k8s::policy::Server>) {
+    match ev {
+        k8s::Event::Applied(srv) => idx.apply_server(srv),
+        k8s::Event::Deleted(srv) => idx.delete_server(srv),
+        k8s::Event::Restarted(srvs) => idx.reset_servers(srvs),
     }
 }
 
-impl std::error::Error for Errors {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.0[0])
-    }
-}
-
-impl Errors {
-    fn ok_if_empty(errors: Vec<anyhow::Error>) -> anyhow::Result<()> {
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(Self(errors).into())
-        }
+pub fn handle_serverauthorizations(
+    idx: &mut Index,
+    ev: k8s::Event<k8s::policy::ServerAuthorization>,
+) {
+    match ev {
+        k8s::Event::Applied(saz) => idx.apply_serverauthorization(saz),
+        k8s::Event::Deleted(saz) => idx.delete_serverauthorization(saz),
+        k8s::Event::Restarted(sazs) => idx.reset_serverauthorizations(sazs),
     }
 }
