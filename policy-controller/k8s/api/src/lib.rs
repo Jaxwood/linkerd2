@@ -16,8 +16,8 @@ use kube::{
     api::{Api, ListParams},
     runtime::watcher,
 };
-use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // pub use kube::runtime::reflector::Store;
 
@@ -70,7 +70,7 @@ where
 /// It is assumed that the event stream is infinite. If an error is encountered, the stream is
 /// immediately polled again; and if this attempt to read from the stream fails, a backoff is
 /// employed before attempting to read from the stream again.
-pub async fn index<T, E, H, S, F>(
+pub async fn index<T, E, H, S, F, Fut>(
     events: E,
     initialized: H,
     backoff: std::time::Duration,
@@ -78,7 +78,8 @@ pub async fn index<T, E, H, S, F>(
     process: F,
 ) where
     E: Stream<Item = EventResult<T>>,
-    F: Fn(&mut S, watcher::Event<T>),
+    F: Fn(&mut S, watcher::Event<T>) -> Fut,
+    Fut: Future<Output = ()>,
 {
     tokio::pin!(events);
 
@@ -89,7 +90,9 @@ pub async fn index<T, E, H, S, F>(
     while let Some(ev) = events.next().await {
         match ev {
             Ok(ev) => {
-                process(&mut *store.lock(), ev);
+                let mut locked = store.lock().await;
+                process(&mut locked, ev).await;
+                drop(locked);
 
                 // Drop the initialization handle if it's set.
                 drop(initialized.take());

@@ -38,3 +38,10 @@ impl Initialize {
         Ok(())
     }
 }
+
+impl Handle {
+    /// Releases the handle
+    pub async fn release(self) {
+        self.0.release().await
+    }
+}
