@@ -1,14 +1,14 @@
 #![deny(warnings, rust_2018_idioms)]
 #![forbid(unsafe_code)]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Parser;
 use futures::prelude::*;
-use kubert::shutdown;
-use linkerd_policy_controller::{admission, api, k8s};
+use kube::api::ListParams;
+use linkerd_policy_controller::{admission, k8s};
 use linkerd_policy_controller_core::IpNet;
 use parking_lot::Mutex;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::time;
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -83,19 +83,25 @@ async fn main() -> Result<()> {
         control_plane_namespace,
     } = Args::parse();
 
-    let builder = kubert::Builder::default()
+    let server = if admission_controller_disabled {
+        None
+    } else {
+        Some(server)
+    };
+    let runtime = kubert::Builder::default()
         .with_admin(admin)
         .with_client(client)
-        .with_log(log_level, log_format);
+        .with_optional_server(server)
+        .with_log(log_level, log_format)
+        .try_build()
+        .await?;
 
-        let rt = admission_controller_disabled {
-            let rt = builder.try_build().await?;
-            let client = rt.client();
-            rt.spawn_server(admission::Service { client })
-        } else {
-            tracing::info!("Admission controller disabled");
-            builder.try_build().await?
-        };
+    let mut runtime = if runtime.has_server() {
+        let client = runtime.client();
+        runtime.spawn_server(|| admission::Service { client })
+    } else {
+        runtime.without_server()
+    };
 
     // Build the index data structure, which will be used to process events from all watches
     // The lookup handle is used by the gRPC server.
@@ -109,71 +115,57 @@ async fn main() -> Result<()> {
         (lookup, Arc::new(Mutex::new(idx)))
     };
 
-    let mut init = init::Initialize::default();
-    let backoff = Duration::from_secs(5);
-
     // Spawn a Pod index
-    tokio::spawn(
-        api::index(
-            api::watch_all_injected_pods(client.clone()),
-            init.add_handle(),
-            backoff,
-            index.clone(),
-            k8s::handle_pods,
-        )
-        .instrument(info_span!("pods")),
-    );
-
-    // Spawn a server watcher
-    tokio::spawn(
-        api::index(
-            api::watch_all_servers(client.clone()),
-            init.add_handle(),
-            backoff,
-            index.clone(),
-            k8s::handle_servers,
-        )
-        .instrument(info_span!("servers")),
-    );
-
-    // Spawn a server watcher
-    tokio::spawn(
-        api::index(
-            api::watch_all_serverauthorizations(client.clone()),
-            init.add_handle(),
-            backoff,
-            index,
-            k8s::handle_serverauthorizations,
-        )
-        .instrument(info_span!("serverauthorizations")),
-    );
-
-    // Spawn a task that marks the process as "ready" once all watches have been initialized.
     tokio::spawn({
-        let readiness = readiness.clone();
-        init.initialized().map(move |_| readiness.set(true))
+        let index = index.clone();
+        let params = ListParams::default().labels("linkerd.io/control-plane-ns");
+        let events = runtime.watch_all(params);
+        async move {
+            tokio::pin!(events);
+            while let Some(ev) = events.next().await {
+                k8s::handle_pods(&mut *index.lock(), ev);
+            }
+        }
+        .instrument(info_span!("pods"))
+    });
+
+    // Spawn a Server index
+    tokio::spawn({
+        let index = index.clone();
+        let events = runtime.watch_all(ListParams::default());
+        async move {
+            tokio::pin!(events);
+            while let Some(ev) = events.next().await {
+                k8s::handle_servers(&mut *index.lock(), ev);
+            }
+        }
+        .instrument(info_span!("servers"))
+    });
+
+    // Spawn a ServerAuthorization index
+    tokio::spawn({
+        let index = index.clone();
+        let events = runtime.watch_all(ListParams::default());
+        async move {
+            tokio::pin!(events);
+            while let Some(ev) = events.next().await {
+                k8s::handle_serverauthorizations(&mut *index.lock(), ev);
+            }
+        }
+        .instrument(info_span!("servers"))
     });
 
     // Run the gRPC server, serving results by looking up against the index handle.
-    tokio::spawn(grpc(grpc_addr, cluster_networks, lookup, drain_rx.clone()));
-
-    // Spawn a task that emits a log message when shutdown starts. It also flips the readiness so
-    // the instance falls out of its Service.
-    tokio::spawn(async move {
-        let release = drain_rx.signaled().await;
-        info!("Shutdown signaled");
-        readiness.set(false);
-        drop(release);
-    });
+    tokio::spawn(grpc(
+        grpc_addr,
+        cluster_networks,
+        lookup,
+        runtime.shutdown_handle(),
+    ));
 
     // Block the main thread on the shutdown signal. Once it fires, wait for the background tasks to
     // complete before exiting.
-    if shutdown
-        .on_signal()
-        .await
-        .expect("Shutdown signal must register")
-        .is_aborted()
-    {
+    if runtime.run().await.is_err() {
         bail!("Aborted");
     }
 
@@ -215,8 +207,4 @@ async fn grpc(
         }
     }
     Ok(())
-}
-
-async fn controller<S>(rt: kubert::Runtime<S>) {
-    unimplemented!()
 }
