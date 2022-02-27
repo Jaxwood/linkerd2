@@ -799,7 +799,7 @@ dependencies = [
 [[package]]
 name = "kubert"
 version = "0.3.0"
-source = "git+https://github.com/olix0r/kubert.git?branch=ver/rt#a40a79791ba3da6aa115b517a8ecbbbb2fb08700"
+source = "git+https://github.com/olix0r/kubert.git?branch=ver/rt#896030a98841827377749d76e92b627a417b8aef"
 dependencies = [
  "clap",
  "drain",
