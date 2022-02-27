@@ -88,20 +88,14 @@ async fn main() -> Result<()> {
     } else {
         Some(server)
     };
-    let runtime = kubert::Builder::default()
+
+    let mut runtime = kubert::Runtime::builder()
+        .with_log(log_level, log_format)
         .with_admin(admin)
         .with_client(client)
         .with_optional_server(server)
-        .with_log(log_level, log_format)
-        .try_build()
+        .build()
         .await?;
-
-    let mut runtime = if runtime.has_server() {
-        let client = runtime.client();
-        runtime.spawn_server(|| admission::Service { client })
-    } else {
-        runtime.without_server()
-    };
 
     // Build the index data structure, which will be used to process events from all watches
     // The lookup handle is used by the gRPC server.
@@ -115,45 +109,19 @@ async fn main() -> Result<()> {
         (lookup, Arc::new(Mutex::new(idx)))
     };
 
-    // Spawn a Pod index
-    tokio::spawn({
-        let index = index.clone();
-        let params = ListParams::default().labels("linkerd.io/control-plane-ns");
-        let events = runtime.watch_all(params);
-        async move {
-            tokio::pin!(events);
-            while let Some(ev) = events.next().await {
-                k8s::handle_pods(&mut *index.lock(), ev);
-            }
-        }
-        .instrument(info_span!("pods"))
-    });
+    // Spawn resource indexers that update the index and publish lookups for the gRPC server.
 
-    // Spawn a Server index
-    tokio::spawn({
-        let index = index.clone();
-        let events = runtime.watch_all(ListParams::default());
-        async move {
-            tokio::pin!(events);
-            while let Some(ev) = events.next().await {
-                k8s::handle_servers(&mut *index.lock(), ev);
-            }
-        }
-        .instrument(info_span!("servers"))
-    });
+    let pods = runtime.watch_all(ListParams::default().labels("linkerd.io/control-plane-ns"));
+    tokio::spawn(k8s::index_pods(index.clone(), pods).instrument(info_span!("pods")));
 
-    // Spawn a ServerAuthorization index
-    tokio::spawn({
-        let index = index.clone();
-        let events = runtime.watch_all(ListParams::default());
-        async move {
-            tokio::pin!(events);
-            while let Some(ev) = events.next().await {
-                k8s::handle_serverauthorizations(&mut *index.lock(), ev);
-            }
-        }
-        .instrument(info_span!("servers"))
-    });
+    let servers = runtime.watch_all(ListParams::default());
+    tokio::spawn(k8s::index_servers(index.clone(), servers).instrument(info_span!("servers")));
+
+    let serverauthorizations = runtime.watch_all(ListParams::default());
+    tokio::spawn(
+        k8s::index_serverauthorizations(index, serverauthorizations)
+            .instrument(info_span!("serverauthorizations")),
+    );
 
     // Run the gRPC server, serving results by looking up against the index handle.
     tokio::spawn(grpc(
@@ -162,6 +130,10 @@ async fn main() -> Result<()> {
         lookup,
         runtime.shutdown_handle(),
     ));
+
+    // TODO use resource caches instead of a client
+    let client = runtime.client();
+    let runtime = runtime.spawn_server(|| admission::Service { client });
 
     // Block the main thread on the shutdown signal. Once it fires, wait for the background tasks to
     // complete before exiting.

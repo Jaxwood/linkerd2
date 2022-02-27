@@ -42,8 +42,11 @@ use self::{
     namespace::{Namespace, NamespaceIndex},
     server::SrvIndex,
 };
+use futures::prelude::*;
 use linkerd_policy_controller_core::{InboundServer, IpNet};
 use linkerd_policy_controller_k8s_api as k8s;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::{sync::watch, time};
 
 /// Watches a server's configuration for server/authorization changes.
@@ -120,29 +123,41 @@ impl Index {
     }
 }
 
-pub fn handle_pods(idx: &mut Index, ev: k8s::Event<k8s::Pod>) {
-    match ev {
-        k8s::Event::Applied(pod) => idx.apply_pod(pod),
-        k8s::Event::Deleted(pod) => idx.delete_pod(pod),
-        k8s::Event::Restarted(pods) => idx.reset_pods(pods),
+pub async fn index_pods(idx: Arc<Mutex<Index>>, events: impl Stream<Item = k8s::Event<k8s::Pod>>) {
+    tokio::pin!(events);
+    while let Some(ev) = events.next().await {
+        match ev {
+            k8s::Event::Applied(pod) => idx.lock().apply_pod(pod),
+            k8s::Event::Deleted(pod) => idx.lock().delete_pod(pod),
+            k8s::Event::Restarted(pods) => idx.lock().reset_pods(pods),
+        }
     }
 }
 
-pub fn handle_servers(idx: &mut Index, ev: k8s::Event<k8s::policy::Server>) {
-    match ev {
-        k8s::Event::Applied(srv) => idx.apply_server(srv),
-        k8s::Event::Deleted(srv) => idx.delete_server(srv),
-        k8s::Event::Restarted(srvs) => idx.reset_servers(srvs),
-    }
-}
-
-pub fn handle_serverauthorizations(
-    idx: &mut Index,
-    ev: k8s::Event<k8s::policy::ServerAuthorization>,
+pub async fn index_servers(
+    idx: Arc<Mutex<Index>>,
+    events: impl Stream<Item = k8s::Event<k8s::policy::Server>>,
 ) {
-    match ev {
-        k8s::Event::Applied(saz) => idx.apply_serverauthorization(saz),
-        k8s::Event::Deleted(saz) => idx.delete_serverauthorization(saz),
-        k8s::Event::Restarted(sazs) => idx.reset_serverauthorizations(sazs),
+    tokio::pin!(events);
+    while let Some(ev) = events.next().await {
+        match ev {
+            k8s::Event::Applied(srv) => idx.lock().apply_server(srv),
+            k8s::Event::Deleted(srv) => idx.lock().delete_server(srv),
+            k8s::Event::Restarted(srvs) => idx.lock().reset_servers(srvs),
+        }
+    }
+}
+
+pub async fn index_serverauthorizations(
+    idx: Arc<Mutex<Index>>,
+    events: impl Stream<Item = k8s::Event<k8s::policy::ServerAuthorization>>,
+) {
+    tokio::pin!(events);
+    while let Some(ev) = events.next().await {
+        match ev {
+            k8s::Event::Applied(saz) => idx.lock().apply_serverauthorization(saz),
+            k8s::Event::Deleted(saz) => idx.lock().delete_serverauthorization(saz),
+            k8s::Event::Restarted(sazs) => idx.lock().reset_serverauthorizations(sazs),
+        }
     }
 }
