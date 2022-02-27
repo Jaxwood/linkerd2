@@ -35,15 +35,12 @@ features = [
 ]
 
 [dependencies.kubert]
-version = "0.2.3"
+version = "0.3.0"
 default-features = false
 features = [
-    "admin",
     "clap",
-    "client",
-    "log",
+    "runtime",
     "server",
-    "shutdown",
 ]
 
 [dependencies.tokio]

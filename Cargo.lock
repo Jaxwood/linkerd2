@@ -798,16 +798,20 @@ dependencies = [
 
 [[package]]
 name = "kubert"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0848a69e2ff82d6678c0f5ee5bf8a3c3b6b8bd2e2114a10a03532d5352b7552"
+version = "0.3.0"
+source = "git+https://github.com/olix0r/kubert.git?branch=ver/rt#ab54760b30f5c7b7bfb94640ea4a90a1eeb72cb6"
 dependencies = [
  "clap",
  "drain",
+ "futures-core",
  "futures-util",
  "hyper",
  "kube-client",
+ "kube-core",
+ "kube-runtime",
+ "pin-project-lite",
  "rustls-pemfile 0.3.0",
+ "serde",
  "thiserror",
  "tokio",
  "tokio-rustls",

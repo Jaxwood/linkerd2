@@ -10,3 +10,6 @@ members = [
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+kubert = { git = "https://github.com/olix0r/kubert.git", branch = "ver/rt" }

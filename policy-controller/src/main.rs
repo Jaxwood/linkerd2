@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use futures::prelude::*;
 use kubert::shutdown;
-use linkerd_policy_controller::{admission, api, init, k8s};
+use linkerd_policy_controller::{admission, api, k8s};
 use linkerd_policy_controller_core::IpNet;
 use parking_lot::Mutex;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -27,16 +27,16 @@ struct Args {
         default_value = "linkerd=info,warn",
         env = "LINKERD_POLICY_CONTROLLER_LOG"
     )]
-    log_level: kubert::log::EnvFilter,
+    log_level: kubert::LogFilter,
 
     #[clap(long, default_value = "plain")]
-    log_format: kubert::log::LogFormat,
+    log_format: kubert::LogFormat,
 
     #[clap(flatten)]
     client: kubert::ClientArgs,
 
     #[clap(flatten)]
-    server: kubert::server::ServerArgs,
+    server: kubert::ServerArgs,
 
     #[clap(flatten)]
     admin: kubert::AdminArgs,
@@ -70,33 +70,32 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let Args {
-        client,
         admin,
-        grpc_addr,
+        client,
+        log_level,
+        log_format,
         server,
+        grpc_addr,
         admission_controller_disabled,
         identity_domain,
         cluster_networks: IpNets(cluster_networks),
         default_policy,
-        log_level,
-        log_format,
         control_plane_namespace,
     } = Args::parse();
 
-    log_format.try_init(log_level)?;
+    let builder = kubert::Builder::default()
+        .with_admin(admin)
+        .with_client(client)
+        .with_log(log_level, log_format);
 
-    // Spawn an admin server, failing readiness checks until the index is updated.
-    let admin = admin.spawn();
-    let readiness = admin.readiness();
-
-    let (shutdown, drain_rx) = shutdown::channel();
-
-    // Load a Kubernetes client from the environment/CLI, checking for in-cluster configuration
-    // first.
-    let client = client
-        .try_client()
-        .await
-        .context("failed to initialize kubernetes client")?;
+        let rt = admission_controller_disabled {
+            let rt = builder.try_build().await?;
+            let client = rt.client();
+            rt.spawn_server(admission::Service { client })
+        } else {
+            tracing::info!("Admission controller disabled");
+            builder.try_build().await?
+        };
 
     // Build the index data structure, which will be used to process events from all watches
     // The lookup handle is used by the gRPC server.
@@ -158,15 +157,6 @@ async fn main() -> Result<()> {
     // Run the gRPC server, serving results by looking up against the index handle.
     tokio::spawn(grpc(grpc_addr, cluster_networks, lookup, drain_rx.clone()));
 
-    if admission_controller_disabled {
-        tracing::info!("Admission controller disabled");
-    } else {
-        let srv = server
-            .spawn(admission::Service { client }, drain_rx.clone())
-            .await?;
-        info!(addr = %srv.local_addr(), "Admission controller server listening");
-    }
-
     // Spawn a task that emits a log message when shutdown starts. It also flips the readiness so
     // the instance falls out of its Service.
     tokio::spawn(async move {
@@ -225,4 +215,8 @@ async fn grpc(
         }
     }
     Ok(())
+}
+
+async fn controller<S>(rt: kubert::Runtime<S>) {
+    unimplemented!()
 }

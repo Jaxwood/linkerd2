@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
-pub mod init;
 
 pub use linkerd_policy_controller_grpc as grpc;
 pub use linkerd_policy_controller_k8s_api as api;
