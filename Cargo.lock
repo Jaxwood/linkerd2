@@ -238,11 +238,10 @@ dependencies = [
 
 [[package]]
 name = "drain"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9701380e51dff309f25d5b3d6639aa757d940821f7bc966faa58b65b5b7e4a18"
+checksum = "2f1a0abf3fcefad9b4dd0e414207a7408e12b68414a01e6bb19b897d5bd7632d"
 dependencies = [
- "futures",
  "tokio",
 ]
 
@@ -799,7 +798,8 @@ dependencies = [
 [[package]]
 name = "kubert"
 version = "0.3.0"
-source = "git+https://github.com/olix0r/kubert.git?branch=ver/rt#896030a98841827377749d76e92b627a417b8aef"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f24d29945d889f7bc174860c880d2bee5699acefb99ed43a23a54be10c00d2"
 dependencies = [
  "clap",
  "drain",
